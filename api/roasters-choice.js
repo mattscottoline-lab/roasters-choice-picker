@@ -74,7 +74,7 @@ function findSizeAndGrindFromLineItems(lineItems) {
   for (const li of lineItems || []) {
     const opts = li?.variant?.selectedOptions || [];
     const size = opts.find(o => o.name === "Size")?.value || null;
-    const grind = opts.find(o => o.name === "Grind Size")?.value || null;
+    const grind = opts.find(o => o.name === "Whole Bean or Ground")?.value || null;
 
     if (size && grind) return { size, grind, lineItem: li };
   }
@@ -220,7 +220,7 @@ async function getEligibleFromCollection(collectionHandle, size, grind) {
       const v = p.variants.nodes.find(vr => {
         if (!vr.availableForSale) return false;
         const vSize = vr.selectedOptions.find(o => o.name === "Size")?.value;
-        const vGrind = vr.selectedOptions.find(o => o.name === "Grind Size")?.value;
+        const vGrind = vr.selectedOptions.find(o => o.name === "Whole Bean or Ground")?.value;
         return vSize === size && vGrind === grind;
       });
 
