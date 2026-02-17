@@ -194,6 +194,7 @@ async function getEligibleFromCollection(collectionHandle, size, grind) {
             title
             handle
             status
+            tags
             variants(first: 100) {
               nodes {
                 id
@@ -219,6 +220,7 @@ async function getEligibleFromCollection(collectionHandle, size, grind) {
     const page = col.products;
     for (const p of page.nodes) {
       if (p.status !== "ACTIVE") continue;
+      if (p.tags.includes("exclude_roasters_choice")) continue;
       const v = p.variants.nodes.find(vr => {
         if (!vr.availableForSale) return false;
         const vSize = vr.selectedOptions.find(o => o.name === "Size")?.value;
