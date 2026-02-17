@@ -1,8 +1,4 @@
-export const config = {
-  api: {
-    bodyParser: false, // we'll parse manually
-  },
-};
+export const config = { api: { bodyParser: false } };
 
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
@@ -37,7 +33,7 @@ export default async function handler(req, res) {
     console.log("Received Roaster's Choice order:", {
       order_id: payload?.order_id,
       order_name: payload?.order_name,
-      customer_id: payload?.customer_id,
+      customer_id: payload?.customer_id
     });
 
     return res.status(200).json({ success: true });
