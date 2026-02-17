@@ -347,7 +347,8 @@ export default async function handler(req, res) {
 ]);
     await appendOrderNote(
   orderId,
-  `ROASTER'S CHOICE PICK:\n${pick.product_title} — ${size} / ${grind}`
+  `${pick.product_title} — ${size} / ${grind}`
+);
 );
 
     lastMap[key] = pick.product_id;
