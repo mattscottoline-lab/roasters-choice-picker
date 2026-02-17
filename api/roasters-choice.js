@@ -152,6 +152,43 @@ async function addOrderTags(orderId, tags) {
   const errs = data?.tagsAdd?.userErrors || [];
   if (errs.length) throw new Error(`tagsAdd errors: ${JSON.stringify(errs)}`);
 }
+async function appendOrderNote(orderId, noteText) {
+
+  // Get existing note
+  const getQuery = `
+    query($id: ID!) {
+      order(id: $id) {
+        id
+        note
+      }
+    }
+  `;
+  const existing = await shopifyGraphQL(getQuery, { id: orderId });
+  const currentNote = existing?.order?.note || "";
+
+  const updatedNote = currentNote
+    ? `${currentNote}\n\n${noteText}`
+    : noteText;
+
+  const mutation = `
+    mutation($input: OrderInput!) {
+      orderUpdate(input: $input) {
+        order { id note }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const result = await shopifyGraphQL(mutation, {
+    input: {
+      id: orderId,
+      note: updatedNote
+    }
+  });
+
+  const errs = result?.orderUpdate?.userErrors || [];
+  if (errs.length) throw new Error(`orderUpdate errors: ${JSON.stringify(errs)}`);
+}
 
 async function getOrder(orderId) {
   const q = `
@@ -308,6 +345,10 @@ export default async function handler(req, res) {
   "RC_PICKED",
   `RC_${pick.product_handle}`
 ]);
+    await appendOrderNote(
+  orderId,
+  `ROASTER'S CHOICE PICK:\n${pick.product_title} — ${size} / ${grind}`
+);
 
     lastMap[key] = pick.product_id;
     await setCustomerLastPickMap(customerId, lastMap);
