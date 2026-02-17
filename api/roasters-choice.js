@@ -349,8 +349,6 @@ export default async function handler(req, res) {
   orderId,
   `${pick.product_title} — ${size} / ${grind}`
 );
-);
-
     lastMap[key] = pick.product_id;
     await setCustomerLastPickMap(customerId, lastMap);
 
