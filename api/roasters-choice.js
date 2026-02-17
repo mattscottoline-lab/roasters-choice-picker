@@ -193,6 +193,7 @@ async function getEligibleFromCollection(collectionHandle, size, grind) {
             id
             title
             handle
+            status
             variants(first: 100) {
               nodes {
                 id
@@ -217,6 +218,7 @@ async function getEligibleFromCollection(collectionHandle, size, grind) {
 
     const page = col.products;
     for (const p of page.nodes) {
+      if (p.status !== "ACTIVE") continue;
       const v = p.variants.nodes.find(vr => {
         if (!vr.availableForSale) return false;
         const vSize = vr.selectedOptions.find(o => o.name === "Size")?.value;
