@@ -302,7 +302,10 @@ export default async function handler(req, res) {
 
     const pickText = `${pick.product_title} — ${size} / ${grind}`;
     await setOrderPick(orderId, pickText);
-    await addOrderTags(orderId, [`RC_PICKED:${pick.product_handle}`]);
+    await addOrderTags(orderId, [
+  "RC_PICKED",
+  `RC_${pick.product_handle}`
+]);
 
     lastMap[key] = pick.product_id;
     await setCustomerLastPickMap(customerId, lastMap);
