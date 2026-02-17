@@ -129,8 +129,8 @@ async function setOrderPick(orderId, pickText) {
   const data = await shopifyGraphQL(m, {
     metafields: [{
       ownerId: orderId,
-      namespace: "roasters_choice",
-      key: "pick",
+      namespace: "custom",
+      key: "roasters_choice_pick",
       type: "single_line_text_field",
       value: pickText
     }]
