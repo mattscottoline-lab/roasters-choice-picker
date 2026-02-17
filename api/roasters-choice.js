@@ -9,12 +9,244 @@ function readRawBody(req) {
   });
 }
 
+// In-memory token cache for warm Vercel instances
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
+async function getAdminToken() {
+  const SHOP = process.env.SHOPIFY_SHOP;
+  const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
+  const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+
+  if (!SHOP || !CLIENT_ID || !CLIENT_SECRET) {
+    throw new Error("Missing SHOPIFY_SHOP / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET env vars");
+  }
+
+  if (cachedToken && Date.now() < tokenExpiresAt - 60_000) return cachedToken;
+
+  const resp = await fetch(`https://${SHOP}.myshopify.com/admin/oauth/access_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET
+    })
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Token request failed: ${resp.status} ${text}`);
+  }
+
+  const { access_token, expires_in } = await resp.json();
+  cachedToken = access_token;
+  tokenExpiresAt = Date.now() + expires_in * 1000;
+  return cachedToken;
+}
+
+async function shopifyGraphQL(query, variables = {}) {
+  const SHOP = process.env.SHOPIFY_SHOP;
+  const API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
+
+  const resp = await fetch(`https://${SHOP}.myshopify.com/admin/api/${API_VERSION}/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": await getAdminToken()
+    },
+    body: JSON.stringify({ query, variables })
+  });
+
+  const json = await resp.json();
+  if (!resp.ok || json.errors) {
+    throw new Error(`GraphQL error: ${resp.status} ${JSON.stringify(json.errors || json)}`);
+  }
+  return json.data;
+}
+
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function findSizeAndGrindFromLineItems(lineItems) {
+  // Find any line item whose variant has selectedOptions containing Size + Grind Size
+  for (const li of lineItems || []) {
+    const opts = li?.variant?.selectedOptions || [];
+    const size = opts.find(o => o.name === "Size")?.value || null;
+    const grind = opts.find(o => o.name === "Grind Size")?.value || null;
+
+    if (size && grind) return { size, grind, lineItem: li };
+  }
+  return { size: null, grind: null, lineItem: null };
+}
+
+async function getCustomerLastPickMap(customerId) {
+  const q = `
+    query($id: ID!) {
+      customer(id: $id) {
+        id
+        metafield(namespace: "roasters_choice", key: "last_pick_map") { value }
+      }
+    }
+  `;
+  const data = await shopifyGraphQL(q, { id: customerId });
+  const raw = data?.customer?.metafield?.value;
+  if (!raw) return {};
+  try { return JSON.parse(raw); } catch { return {}; }
+}
+
+async function setCustomerLastPickMap(customerId, mapObj) {
+  const m = `
+    mutation($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await shopifyGraphQL(m, {
+    metafields: [{
+      ownerId: customerId,
+      namespace: "roasters_choice",
+      key: "last_pick_map",
+      type: "single_line_text_field",
+      value: JSON.stringify(mapObj)
+    }]
+  });
+
+  const errs = data?.metafieldsSet?.userErrors || [];
+  if (errs.length) throw new Error(`Customer metafieldsSet errors: ${JSON.stringify(errs)}`);
+}
+
+async function setOrderPick(orderId, pickText) {
+  const m = `
+    mutation($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await shopifyGraphQL(m, {
+    metafields: [{
+      ownerId: orderId,
+      namespace: "roasters_choice",
+      key: "pick",
+      type: "single_line_text_field",
+      value: pickText
+    }]
+  });
+
+  const errs = data?.metafieldsSet?.userErrors || [];
+  if (errs.length) throw new Error(`Order metafieldsSet errors: ${JSON.stringify(errs)}`);
+}
+
+async function addOrderTags(orderId, tags) {
+  const m = `
+    mutation($id: ID!, $tags: [String!]!) {
+      tagsAdd(id: $id, tags: $tags) {
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await shopifyGraphQL(m, { id: orderId, tags });
+  const errs = data?.tagsAdd?.userErrors || [];
+  if (errs.length) throw new Error(`tagsAdd errors: ${JSON.stringify(errs)}`);
+}
+
+async function getOrder(orderId) {
+  const q = `
+    query($id: ID!) {
+      order(id: $id) {
+        id
+        name
+        customer { id email }
+        lineItems(first: 50) {
+          nodes {
+            id
+            title
+            quantity
+            variant {
+              id
+              title
+              selectedOptions { name value }
+              product { id title handle }
+            }
+          }
+        }
+      }
+    }
+  `;
+  const data = await shopifyGraphQL(q, { id: orderId });
+  if (!data?.order) throw new Error("Order not found");
+  return data.order;
+}
+
+async function getEligibleFromCollection(collectionHandle, size, grind) {
+  const q = `
+    query($handle: String!, $cursor: String) {
+      collectionByHandle(handle: $handle) {
+        id
+        title
+        products(first: 100, after: $cursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            id
+            title
+            handle
+            variants(first: 100) {
+              nodes {
+                id
+                title
+                availableForSale
+                selectedOptions { name value }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  let cursor = null;
+  const candidates = [];
+
+  while (true) {
+    const data = await shopifyGraphQL(q, { handle: collectionHandle, cursor });
+    const col = data?.collectionByHandle;
+    if (!col) throw new Error(`Collection not found: ${collectionHandle}`);
+
+    const page = col.products;
+    for (const p of page.nodes) {
+      const v = p.variants.nodes.find(vr => {
+        if (!vr.availableForSale) return false;
+        const vSize = vr.selectedOptions.find(o => o.name === "Size")?.value;
+        const vGrind = vr.selectedOptions.find(o => o.name === "Grind Size")?.value;
+        return vSize === size && vGrind === grind;
+      });
+
+      if (v) {
+        candidates.push({
+          product_id: p.id,
+          product_title: p.title,
+          product_handle: p.handle,
+          variant_id: v.id
+        });
+      }
+    }
+
+    if (!page.pageInfo.hasNextPage) break;
+    cursor = page.pageInfo.endCursor;
+  }
+
+  return candidates;
+}
+
 export default async function handler(req, res) {
-  const EXPECTED_TOKEN = "rc_3bfa8d1c9e2a4f7b6c8d0e1f2a3b4c5d";
+  const expected = process.env.RC_SHARED_SECRET;
 
   try {
     const incomingToken = req.headers["x-rc-token"];
-    if (!incomingToken || incomingToken !== EXPECTED_TOKEN) {
+    if (!incomingToken || incomingToken !== expected) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
@@ -24,21 +256,67 @@ export default async function handler(req, res) {
 
     const raw = await readRawBody(req);
     let payload;
-    try {
-      payload = JSON.parse(raw);
-    } catch (e) {
-      return res.status(400).json({ error: "Invalid JSON", raw });
+    try { payload = JSON.parse(raw); }
+    catch { return res.status(400).json({ error: "Invalid JSON" }); }
+
+    const orderId = payload?.order_id;
+    if (!orderId) return res.status(400).json({ error: "Missing order_id" });
+
+    const order = await getOrder(orderId);
+    const customerId = order?.customer?.id;
+
+    if (!customerId) {
+      return res.status(409).json({ error: "Order has no customer; cannot enforce repeat protection" });
     }
 
-    console.log("Received Roaster's Choice order:", {
-      order_id: payload?.order_id,
-      order_name: payload?.order_name,
-      customer_id: payload?.customer_id
-    });
+    const lineItems = order.lineItems.nodes;
+    const { size, grind } = findSizeAndGrindFromLineItems(lineItems);
 
-    return res.status(200).json({ success: true });
+    if (!size || !grind) {
+      return res.status(409).json({
+        error: "Could not determine Size and Grind Size from order line items",
+        order_name: order.name
+      });
+    }
+
+    const key = `${size}|${grind}`;
+    const lastMap = await getCustomerLastPickMap(customerId);
+    const lastProductId = lastMap[key] || null;
+
+    const collectionHandle = "single-origin-coffee";
+    let candidates = await getEligibleFromCollection(collectionHandle, size, grind);
+
+    if (candidates.length === 0) {
+      return res.status(409).json({ error: "No eligible coffees found", size, grind });
+    }
+
+    // No-repeat if possible
+    if (lastProductId && candidates.length > 1) {
+      const filtered = candidates.filter(c => c.product_id !== lastProductId);
+      if (filtered.length > 0) candidates = filtered;
+    }
+
+    const pick = pickRandom(candidates);
+
+    const pickText = `${pick.product_title} — ${size} / ${grind}`;
+    await setOrderPick(orderId, pickText);
+    await addOrderTags(orderId, [`RC_PICKED:${pick.product_handle}`]);
+
+    lastMap[key] = pick.product_id;
+    await setCustomerLastPickMap(customerId, lastMap);
+
+    return res.status(200).json({
+      success: true,
+      order: order.name,
+      pick: {
+        product_title: pick.product_title,
+        product_handle: pick.product_handle,
+        size,
+        grind
+      }
+    });
   } catch (err) {
-    console.error("Handler error:", err);
-    return res.status(500).json({ error: "Server error" });
+    console.error("Roasters Choice handler error:", err);
+    return res.status(500).json({ error: String(err?.message || err) });
   }
 }
