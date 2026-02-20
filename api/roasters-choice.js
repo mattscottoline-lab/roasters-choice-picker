@@ -19,7 +19,9 @@ async function getAdminToken() {
   const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 
   if (!SHOP || !CLIENT_ID || !CLIENT_SECRET) {
-    throw new Error("Missing SHOPIFY_SHOP / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET env vars");
+    throw new Error(
+      "Missing SHOPIFY_SHOP / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET env vars"
+    );
   }
 
   if (cachedToken && Date.now() < tokenExpiresAt - 60_000) return cachedToken;
@@ -30,8 +32,8 @@ async function getAdminToken() {
     body: new URLSearchParams({
       grant_type: "client_credentials",
       client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET
-    })
+      client_secret: CLIENT_SECRET,
+    }),
   });
 
   if (!resp.ok) {
@@ -53,9 +55,9 @@ async function shopifyGraphQL(query, variables = {}) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": await getAdminToken()
+      "X-Shopify-Access-Token": await getAdminToken(),
     },
-    body: JSON.stringify({ query, variables })
+    body: JSON.stringify({ query, variables }),
   });
 
   const json = await resp.json();
@@ -73,8 +75,8 @@ function findSizeAndGrindFromLineItems(lineItems) {
   // Find any line item whose variant has selectedOptions containing Size + Grind Size
   for (const li of lineItems || []) {
     const opts = li?.variant?.selectedOptions || [];
-    const size = opts.find(o => o.name === "Size")?.value || null;
-    const grind = opts.find(o => o.name === "Grind Size")?.value || null;
+    const size = opts.find((o) => o.name === "Size")?.value || null;
+    const grind = opts.find((o) => o.name === "Grind Size")?.value || null;
 
     if (size && grind) return { size, grind, lineItem: li };
   }
@@ -93,7 +95,11 @@ async function getCustomerLastPickMap(customerId) {
   const data = await shopifyGraphQL(q, { id: customerId });
   const raw = data?.customer?.metafield?.value;
   if (!raw) return {};
-  try { return JSON.parse(raw); } catch { return {}; }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
 }
 
 async function setCustomerLastPickMap(customerId, mapObj) {
@@ -105,13 +111,15 @@ async function setCustomerLastPickMap(customerId, mapObj) {
     }
   `;
   const data = await shopifyGraphQL(m, {
-    metafields: [{
-      ownerId: customerId,
-      namespace: "roasters_choice",
-      key: "last_pick_map",
-      type: "single_line_text_field",
-      value: JSON.stringify(mapObj)
-    }]
+    metafields: [
+      {
+        ownerId: customerId,
+        namespace: "roasters_choice",
+        key: "last_pick_map",
+        type: "single_line_text_field",
+        value: JSON.stringify(mapObj),
+      },
+    ],
   });
 
   const errs = data?.metafieldsSet?.userErrors || [];
@@ -127,17 +135,33 @@ async function setOrderPick(orderId, pickText) {
     }
   `;
   const data = await shopifyGraphQL(m, {
-    metafields: [{
-      ownerId: orderId,
-      namespace: "custom",
-      key: "roasters_choice_pick",
-      type: "single_line_text_field",
-      value: pickText
-    }]
+    metafields: [
+      {
+        ownerId: orderId,
+        namespace: "custom",
+        key: "roasters_choice_pick",
+        type: "single_line_text_field",
+        value: pickText,
+      },
+    ],
   });
 
   const errs = data?.metafieldsSet?.userErrors || [];
   if (errs.length) throw new Error(`Order metafieldsSet errors: ${JSON.stringify(errs)}`);
+}
+
+async function getOrderPickText(orderId) {
+  const q = `
+    query($id: ID!) {
+      order(id: $id) {
+        metafield(namespace: "custom", key: "roasters_choice_pick") {
+          value
+        }
+      }
+    }
+  `;
+  const data = await shopifyGraphQL(q, { id: orderId });
+  return data?.order?.metafield?.value || null;
 }
 
 async function addOrderTags(orderId, tags) {
@@ -152,8 +176,8 @@ async function addOrderTags(orderId, tags) {
   const errs = data?.tagsAdd?.userErrors || [];
   if (errs.length) throw new Error(`tagsAdd errors: ${JSON.stringify(errs)}`);
 }
-async function appendOrderNote(orderId, noteText) {
 
+async function appendOrderNote(orderId, noteText) {
   // Get existing note
   const getQuery = `
     query($id: ID!) {
@@ -166,9 +190,7 @@ async function appendOrderNote(orderId, noteText) {
   const existing = await shopifyGraphQL(getQuery, { id: orderId });
   const currentNote = existing?.order?.note || "";
 
-  const updatedNote = currentNote
-    ? `${currentNote}\n\n${noteText}`
-    : noteText;
+  const updatedNote = currentNote ? `${currentNote}\n\n${noteText}` : noteText;
 
   const mutation = `
     mutation($input: OrderInput!) {
@@ -182,8 +204,8 @@ async function appendOrderNote(orderId, noteText) {
   const result = await shopifyGraphQL(mutation, {
     input: {
       id: orderId,
-      note: updatedNote
-    }
+      note: updatedNote,
+    },
   });
 
   const errs = result?.orderUpdate?.userErrors || [];
@@ -257,11 +279,12 @@ async function getEligibleFromCollection(collectionHandle, size, grind) {
     const page = col.products;
     for (const p of page.nodes) {
       if (p.status !== "ACTIVE") continue;
-      if (p.tags.includes("exclude_roasters_choice")) continue;
-      const v = p.variants.nodes.find(vr => {
+      if (p.tags?.includes("exclude_roasters_choice")) continue;
+
+      const v = p.variants.nodes.find((vr) => {
         if (!vr.availableForSale) return false;
-        const vSize = vr.selectedOptions.find(o => o.name === "Size")?.value;
-        const vGrind = vr.selectedOptions.find(o => o.name === "Whole Bean or Ground")?.value;
+        const vSize = vr.selectedOptions.find((o) => o.name === "Size")?.value;
+        const vGrind = vr.selectedOptions.find((o) => o.name === "Whole Bean or Ground")?.value;
         return vSize === size && vGrind === grind;
       });
 
@@ -270,7 +293,7 @@ async function getEligibleFromCollection(collectionHandle, size, grind) {
           product_id: p.id,
           product_title: p.title,
           product_handle: p.handle,
-          variant_id: v.id
+          variant_id: v.id,
         });
       }
     }
@@ -297,17 +320,42 @@ export default async function handler(req, res) {
 
     const raw = await readRawBody(req);
     let payload;
-    try { payload = JSON.parse(raw); }
-    catch { return res.status(400).json({ error: "Invalid JSON" }); }
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      return res.status(400).json({ error: "Invalid JSON" });
+    }
 
     const orderId = payload?.order_id;
     if (!orderId) return res.status(400).json({ error: "Missing order_id" });
+
+    // NOTE MODE: called by the delayed Flow to re-write the note after Smartrr overwrites it
+    const mode = req.query?.mode;
+
+    if (mode === "note") {
+      const pickText = await getOrderPickText(orderId);
+
+      // If Flow #1 hasn't saved the pick yet, don't fail—just exit cleanly
+      if (!pickText) {
+        return res.status(200).json({ success: true, mode: "note", message: "No pick saved yet" });
+      }
+
+      // Re-write the order note (ShipStation prints this)
+      await appendOrderNote(orderId, pickText);
+
+      // Mark so the delayed Flow doesn't run repeatedly
+      await addOrderTags(orderId, ["RC_NOTE_SET"]);
+
+      return res.status(200).json({ success: true, mode: "note" });
+    }
 
     const order = await getOrder(orderId);
     const customerId = order?.customer?.id;
 
     if (!customerId) {
-      return res.status(409).json({ error: "Order has no customer; cannot enforce repeat protection" });
+      return res
+        .status(409)
+        .json({ error: "Order has no customer; cannot enforce repeat protection" });
     }
 
     const lineItems = order.lineItems.nodes;
@@ -316,7 +364,7 @@ export default async function handler(req, res) {
     if (!size || !grind) {
       return res.status(409).json({
         error: "Could not determine Size and Grind Size from order line items",
-        order_name: order.name
+        order_name: order.name,
       });
     }
 
@@ -333,7 +381,7 @@ export default async function handler(req, res) {
 
     // No-repeat if possible
     if (lastProductId && candidates.length > 1) {
-      const filtered = candidates.filter(c => c.product_id !== lastProductId);
+      const filtered = candidates.filter((c) => c.product_id !== lastProductId);
       if (filtered.length > 0) candidates = filtered;
     }
 
@@ -341,14 +389,11 @@ export default async function handler(req, res) {
 
     const pickText = `${pick.product_title} — ${size} / ${grind}`;
     await setOrderPick(orderId, pickText);
-    await addOrderTags(orderId, [
-  "RC_PICKED",
-  `RC_${pick.product_handle}`
-]);
-    await appendOrderNote(
-  orderId,
-  `${pick.product_title} — ${size} / ${grind}`
-);
+
+    await addOrderTags(orderId, ["RC_PICKED", `RC_${pick.product_handle}`]);
+
+    await appendOrderNote(orderId, pickText);
+
     lastMap[key] = pick.product_id;
     await setCustomerLastPickMap(customerId, lastMap);
 
@@ -359,8 +404,8 @@ export default async function handler(req, res) {
         product_title: pick.product_title,
         product_handle: pick.product_handle,
         size,
-        grind
-      }
+        grind,
+      },
     });
   } catch (err) {
     console.error("Roasters Choice handler error:", err);
