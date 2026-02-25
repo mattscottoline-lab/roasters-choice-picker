@@ -76,7 +76,10 @@ function findSizeAndGrindFromLineItems(lineItems) {
   for (const li of lineItems || []) {
     const opts = li?.variant?.selectedOptions || [];
     const size = opts.find((o) => o.name === "Size")?.value || null;
-    const grind = opts.find((o) => o.name === "Grind Size")?.value || null;
+    const grind =
+      opts.find(o => o.name === "Grind Size")?.value ||
+      opts.find(o => o.name === "Whole Bean or Ground")?.value ||
+  null;
 
     if (size && grind) return { size, grind, lineItem: li };
   }
