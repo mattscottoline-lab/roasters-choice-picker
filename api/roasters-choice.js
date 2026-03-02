@@ -307,7 +307,15 @@ async function getEligibleFromCollection(collectionHandle, size, grind) {
 
   return candidates;
 }
-
+function makeSafeTag(str) {
+  return (
+    "RC_" +
+    String(str || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9-_]+/g, "-")
+      .slice(0, 50)
+  );
+}
 export default async function handler(req, res) {
   const expected = process.env.RC_SHARED_SECRET;
 
@@ -393,7 +401,10 @@ export default async function handler(req, res) {
     const pickText = `${pick.product_title} — ${size} / ${grind}`;
     await setOrderPick(orderId, pickText);
 
-    await addOrderTags(orderId, ["RC_PICKED", `RC_${pick.product_handle}`]);
+   await addOrderTags(orderId, [
+  "RC_PICKED",
+  makeSafeTag(pick.product_handle)
+]);
 
     await appendOrderNote(orderId, pickText);
 
