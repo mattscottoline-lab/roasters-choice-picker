@@ -385,22 +385,7 @@ export default async function handler(req, res) {
 
     const collectionHandle = "single-origin-coffee";
     let candidates = await getEligibleFromCollection(collectionHandle, size, grind);
-    const debug = req.query?.debug === "1";
-
-if (debug) {
-  return res.status(200).json({
-    success: true,
-    debug: true,
-    order: order.name,
-    size,
-    grind,
-    candidates_count: candidates.length,
-    candidates: candidates.map(c => ({
-      product_title: c.product_title,
-      product_handle: c.product_handle
-    }))
-  });
-}
+    
 
     if (candidates.length === 0) {
       return res.status(409).json({ error: "No eligible coffees found", size, grind });
@@ -411,7 +396,24 @@ if (debug) {
       const filtered = candidates.filter((c) => c.product_id !== lastProductId);
       if (filtered.length > 0) candidates = filtered;
     }
+const debug = req.query?.debug === "1";
 
+if (debug) {
+  return res.status(200).json({
+    success: true,
+    debug: true,
+    order: order.name,
+    size,
+    grind,
+    lastProductId,
+    candidates_count: candidates.length,
+    candidates: candidates.map(c => ({
+      product_title: c.product_title,
+      product_handle: c.product_handle,
+      product_id: c.product_id
+    }))
+  });
+}
     const pick = pickRandom(candidates);
 
     const pickText = `${pick.product_title} — ${size} / ${grind}`;
