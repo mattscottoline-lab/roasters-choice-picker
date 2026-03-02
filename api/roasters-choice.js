@@ -385,6 +385,22 @@ export default async function handler(req, res) {
 
     const collectionHandle = "single-origin-coffee";
     let candidates = await getEligibleFromCollection(collectionHandle, size, grind);
+    const debug = req.query?.debug === "1";
+
+if (debug) {
+  return res.status(200).json({
+    success: true,
+    debug: true,
+    order: order.name,
+    size,
+    grind,
+    candidates_count: candidates.length,
+    candidates: candidates.map(c => ({
+      product_title: c.product_title,
+      product_handle: c.product_handle
+    }))
+  });
+}
 
     if (candidates.length === 0) {
       return res.status(409).json({ error: "No eligible coffees found", size, grind });
