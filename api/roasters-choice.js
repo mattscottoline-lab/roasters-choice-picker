@@ -243,12 +243,11 @@ async function getOrder(orderId) {
   return data.order;
 }
 
-async function getEligibleFromCollection(collectionHandle, size, grind) {
+async function getEligibleFromCollection(collectionHandle) {
   const q = `
     query($handle: String!, $cursor: String) {
       collectionByHandle(handle: $handle) {
         id
-        title
         products(first: 100, after: $cursor) {
           pageInfo { hasNextPage endCursor }
           nodes {
@@ -257,14 +256,6 @@ async function getEligibleFromCollection(collectionHandle, size, grind) {
             handle
             status
             tags
-            variants(first: 100) {
-              nodes {
-                id
-                title
-                availableForSale
-                selectedOptions { name value }
-              }
-            }
           }
         }
       }
@@ -280,25 +271,16 @@ async function getEligibleFromCollection(collectionHandle, size, grind) {
     if (!col) throw new Error(`Collection not found: ${collectionHandle}`);
 
     const page = col.products;
+
     for (const p of page.nodes) {
       if (p.status !== "ACTIVE") continue;
-      if (p.tags?.includes("exclude_roasters_choice")) continue;
+      if (p.tags.includes("exclude_roasters_choice")) continue;
 
-      const v = p.variants.nodes.find((vr) => {
-        if (!vr.availableForSale) return false;
-        const vSize = vr.selectedOptions.find((o) => o.name === "Size")?.value;
-        const vGrind = vr.selectedOptions.find((o) => o.name === "Whole Bean or Ground")?.value;
-        return vSize === size && vGrind === grind;
+      candidates.push({
+        product_id: p.id,
+        product_title: p.title,
+        product_handle: p.handle
       });
-
-      if (v) {
-        candidates.push({
-          product_id: p.id,
-          product_title: p.title,
-          product_handle: p.handle,
-          variant_id: v.id,
-        });
-      }
     }
 
     if (!page.pageInfo.hasNextPage) break;
@@ -379,13 +361,12 @@ export default async function handler(req, res) {
       });
     }
 
-    const key = `${size}|${grind}`;
+    const key = "global";
     const lastMap = await getCustomerLastPickMap(customerId);
     const lastProductId = lastMap[key] || null;
 
     const collectionHandle = "single-origin-coffee";
-    let candidates = await getEligibleFromCollection(collectionHandle, size, grind);
-    
+let candidates = await getEligibleFromCollection(collectionHandle);    
 
     if (candidates.length === 0) {
       return res.status(409).json({ error: "No eligible coffees found", size, grind });
