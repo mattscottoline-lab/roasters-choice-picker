@@ -413,9 +413,11 @@ if (!pick) {
     const pickText = `${pick.product_title} — ${size} / ${grind}`;
     await setOrderPick(orderId, pickText);
 
-   await addOrderTags(orderId, [
+const pid = numericIdFromGid(pick.product_id);
+
+await addOrderTags(orderId, [
   "RC_PICKED",
-  makeSafeTag(pick.product_handle)
+  `RC_PID_${pid}`
 ]);
 
     await appendOrderNote(orderId, pickText);
