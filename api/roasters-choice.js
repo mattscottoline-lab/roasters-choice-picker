@@ -66,7 +66,9 @@ async function shopifyGraphQL(query, variables = {}) {
   }
   return json.data;
 }
-
+function numericIdFromGid(gid) {
+  return String(gid || "").split("/").pop();
+}
 function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
