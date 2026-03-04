@@ -395,7 +395,18 @@ if (debug) {
     }))
   });
 }
-    const pick = pickRandom(candidates);
+    // TEMP: allow forcing a specific coffee for testing
+const force = req.query?.force;
+
+let pick = null;
+
+if (force) {
+  pick = candidates.find(c => c.product_handle === force) || null;
+}
+
+if (!pick) {
+  pick = pickRandom(candidates);
+}
 
     const pickText = `${pick.product_title} — ${size} / ${grind}`;
     await setOrderPick(orderId, pickText);
