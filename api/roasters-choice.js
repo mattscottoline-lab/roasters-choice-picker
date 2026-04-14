@@ -74,17 +74,44 @@ function pickRandom(arr) {
 }
 
 function findSizeAndGrindFromLineItems(lineItems) {
-  // Find any line item whose variant has selectedOptions containing Size + Grind Size
+  // First try to find the actual Single Origin Subscription item
+  const singleOriginLineItem = (lineItems || []).find((li) => {
+    const productTitle = li?.variant?.product?.title || "";
+    const lineTitle = li?.title || "";
+    const variantTitle = li?.variant?.title || "";
+
+    return (
+      productTitle.includes("Single Origin Subscription") ||
+      lineTitle.includes("Single Origin Subscription") ||
+      variantTitle.includes("Single Origin - Roaster's Choice")
+    );
+  });
+
+  if (singleOriginLineItem) {
+    const opts = singleOriginLineItem?.variant?.selectedOptions || [];
+    const size = opts.find((o) => o.name === "Size")?.value || null;
+    const grind =
+      opts.find((o) => o.name === "Grind Size")?.value ||
+      opts.find((o) => o.name === "Whole Bean or Ground")?.value ||
+      null;
+
+    if (size && grind) {
+      return { size, grind, lineItem: singleOriginLineItem };
+    }
+  }
+
+  // Fallback: old behavior
   for (const li of lineItems || []) {
     const opts = li?.variant?.selectedOptions || [];
     const size = opts.find((o) => o.name === "Size")?.value || null;
     const grind =
-      opts.find(o => o.name === "Grind Size")?.value ||
-      opts.find(o => o.name === "Whole Bean or Ground")?.value ||
-  null;
+      opts.find((o) => o.name === "Grind Size")?.value ||
+      opts.find((o) => o.name === "Whole Bean or Ground")?.value ||
+      null;
 
     if (size && grind) return { size, grind, lineItem: li };
   }
+
   return { size: null, grind: null, lineItem: null };
 }
 
