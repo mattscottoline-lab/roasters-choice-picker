@@ -222,7 +222,7 @@ async function appendOrderNote(orderId, noteText) {
   const existing = await shopifyGraphQL(getQuery, { id: orderId });
   const currentNote = existing?.order?.note || "";
 
-  const updatedNote = currentNote ? `${currentNote}\n\n${noteText}` : noteText;
+  const updatedNote = noteText;
 
   const mutation = `
     mutation($input: OrderInput!) {
