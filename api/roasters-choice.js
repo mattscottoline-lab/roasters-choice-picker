@@ -17,15 +17,12 @@ async function getAdminToken() {
   const SHOP = process.env.SHOPIFY_SHOP;
   const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
   const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
-
   if (!SHOP || !CLIENT_ID || !CLIENT_SECRET) {
     throw new Error(
       "Missing SHOPIFY_SHOP / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET env vars"
     );
   }
-
   if (cachedToken && Date.now() < tokenExpiresAt - 60_000) return cachedToken;
-
   const resp = await fetch(`https://${SHOP}.myshopify.com/admin/oauth/access_token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -35,12 +32,10 @@ async function getAdminToken() {
       client_secret: CLIENT_SECRET,
     }),
   });
-
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`Token request failed: ${resp.status} ${text}`);
   }
-
   const { access_token, expires_in } = await resp.json();
   cachedToken = access_token;
   tokenExpiresAt = Date.now() + expires_in * 1000;
@@ -50,7 +45,6 @@ async function getAdminToken() {
 async function shopifyGraphQL(query, variables = {}) {
   const SHOP = process.env.SHOPIFY_SHOP;
   const API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-01";
-
   const resp = await fetch(`https://${SHOP}.myshopify.com/admin/api/${API_VERSION}/graphql.json`, {
     method: "POST",
     headers: {
@@ -59,19 +53,44 @@ async function shopifyGraphQL(query, variables = {}) {
     },
     body: JSON.stringify({ query, variables }),
   });
-
   const json = await resp.json();
   if (!resp.ok || json.errors) {
     throw new Error(`GraphQL error: ${resp.status} ${JSON.stringify(json.errors || json)}`);
   }
   return json.data;
 }
+
 function numericIdFromGid(gid) {
   return String(gid || "").split("/").pop();
 }
+
 function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
+
+/* ── PATCH 2026-08-04 ─────────────────────────────────────────────────────────
+   Theme 2.0 lets a new subscriber choose their FIRST coffee. The storefront
+   attaches that choice to the subscription line item as the hidden line-item
+   property `_first_coffee_request` (value = a product handle).
+
+   This helper reads it. It is deliberately defensive: any missing piece just
+   returns null, which sends the request straight down the existing random path.
+   ──────────────────────────────────────────────────────────────────────────── */
+const FIRST_REQUEST_PROP = "_first_coffee_request";
+const FIRST_ORDER_TAG = "Subscription First Order";
+
+function getRequestedHandle(lineItem) {
+  try {
+    const attrs = lineItem?.customAttributes || [];
+    const hit = attrs.find((a) => a && a.key === FIRST_REQUEST_PROP);
+    const val = hit && typeof hit.value === "string" ? hit.value.trim() : "";
+    return val || null;
+  } catch (e) {
+    console.error("getRequestedHandle failed, falling back to random:", e);
+    return null;
+  }
+}
+/* ── end patch helper ─────────────────────────────────────────────────────── */
 
 function findSizeAndGrindFromLineItems(lineItems) {
   // First try to find the actual Single Origin Subscription item
@@ -79,7 +98,6 @@ function findSizeAndGrindFromLineItems(lineItems) {
     const productTitle = li?.variant?.product?.title || "";
     const lineTitle = li?.title || "";
     const variantTitle = li?.variant?.title || "";
-
     return (
       productTitle.includes("Single Origin Subscription") ||
       lineTitle.includes("Single Origin Subscription") ||
@@ -94,7 +112,6 @@ function findSizeAndGrindFromLineItems(lineItems) {
       opts.find((o) => o.name === "Grind Size")?.value ||
       opts.find((o) => o.name === "Whole Bean or Ground")?.value ||
       null;
-
     if (size && grind) {
       return { size, grind, lineItem: singleOriginLineItem };
     }
@@ -108,10 +125,8 @@ function findSizeAndGrindFromLineItems(lineItems) {
       opts.find((o) => o.name === "Grind Size")?.value ||
       opts.find((o) => o.name === "Whole Bean or Ground")?.value ||
       null;
-
     if (size && grind) return { size, grind, lineItem: li };
   }
-
   return { size: null, grind: null, lineItem: null };
 }
 
@@ -153,7 +168,6 @@ async function setCustomerLastPickMap(customerId, mapObj) {
       },
     ],
   });
-
   const errs = data?.metafieldsSet?.userErrors || [];
   if (errs.length) throw new Error(`Customer metafieldsSet errors: ${JSON.stringify(errs)}`);
 }
@@ -177,7 +191,6 @@ async function setOrderPick(orderId, pickText) {
       },
     ],
   });
-
   const errs = data?.metafieldsSet?.userErrors || [];
   if (errs.length) throw new Error(`Order metafieldsSet errors: ${JSON.stringify(errs)}`);
 }
@@ -221,7 +234,6 @@ async function appendOrderNote(orderId, noteText) {
   `;
   const existing = await shopifyGraphQL(getQuery, { id: orderId });
   const currentNote = existing?.order?.note || "";
-
   const updatedNote = noteText;
 
   const mutation = `
@@ -232,30 +244,33 @@ async function appendOrderNote(orderId, noteText) {
       }
     }
   `;
-
   const result = await shopifyGraphQL(mutation, {
     input: {
       id: orderId,
       note: updatedNote,
     },
   });
-
   const errs = result?.orderUpdate?.userErrors || [];
   if (errs.length) throw new Error(`orderUpdate errors: ${JSON.stringify(errs)}`);
 }
 
 async function getOrder(orderId) {
+  /* PATCH 2026-08-04: added `tags` (to detect first vs recurring order) and
+     lineItem `customAttributes` (to read _first_coffee_request). Everything
+     else in this query is unchanged. */
   const q = `
     query($id: ID!) {
       order(id: $id) {
         id
         name
+        tags
         customer { id email }
         lineItems(first: 50) {
           nodes {
             id
             title
             quantity
+            customAttributes { key value }
             variant {
               id
               title
@@ -290,34 +305,28 @@ async function getEligibleFromCollection(collectionHandle) {
       }
     }
   `;
-
   let cursor = null;
   const candidates = [];
-
   while (true) {
     const data = await shopifyGraphQL(q, { handle: collectionHandle, cursor });
     const col = data?.collectionByHandle;
     if (!col) throw new Error(`Collection not found: ${collectionHandle}`);
-
     const page = col.products;
-
     for (const p of page.nodes) {
       if (p.status !== "ACTIVE") continue;
       if (p.tags.includes("exclude_roasters_choice")) continue;
-
       candidates.push({
         product_id: p.id,
         product_title: p.title,
         product_handle: p.handle
       });
     }
-
     if (!page.pageInfo.hasNextPage) break;
     cursor = page.pageInfo.endCursor;
   }
-
   return candidates;
 }
+
 function makeSafeTag(str) {
   return (
     "RC_" +
@@ -327,15 +336,14 @@ function makeSafeTag(str) {
       .slice(0, 50)
   );
 }
+
 export default async function handler(req, res) {
   const expected = process.env.RC_SHARED_SECRET;
-
   try {
     const incomingToken = req.headers["x-rc-token"];
     if (!incomingToken || incomingToken !== expected) {
       return res.status(401).json({ error: "Unauthorized" });
     }
-
     if (req.method !== "POST") {
       return res.status(405).json({ error: "Method Not Allowed" });
     }
@@ -353,27 +361,21 @@ export default async function handler(req, res) {
 
     // NOTE MODE: called by the delayed Flow to re-write the note after Smartrr overwrites it
     const mode = req.query?.mode;
-
     if (mode === "note") {
       const pickText = await getOrderPickText(orderId);
-
       // If Flow #1 hasn't saved the pick yet, don't fail—just exit cleanly
       if (!pickText) {
         return res.status(200).json({ success: true, mode: "note", message: "No pick saved yet" });
       }
-
       // Re-write the order note (ShipStation prints this)
       await appendOrderNote(orderId, pickText);
-
       // Mark so the delayed Flow doesn't run repeatedly
       await addOrderTags(orderId, ["RC_NOTE_SET"]);
-
       return res.status(200).json({ success: true, mode: "note" });
     }
 
     const order = await getOrder(orderId);
     const customerId = order?.customer?.id;
-
     if (!customerId) {
       return res
         .status(409)
@@ -381,8 +383,9 @@ export default async function handler(req, res) {
     }
 
     const lineItems = order.lineItems.nodes;
-    const { size, grind } = findSizeAndGrindFromLineItems(lineItems);
-
+    /* PATCH: also capture the matched Single Origin line item so we can read
+       its _first_coffee_request property below. */
+    const { size, grind, lineItem: soLineItem } = findSizeAndGrindFromLineItems(lineItems);
     if (!size || !grind) {
       return res.status(409).json({
         error: "Could not determine Size and Grind Size from order line items",
@@ -395,57 +398,97 @@ export default async function handler(req, res) {
     const lastProductId = lastMap[key] || null;
 
     const collectionHandle = "single-origin-coffee";
-let candidates = await getEligibleFromCollection(collectionHandle);    
-
+    let candidates = await getEligibleFromCollection(collectionHandle);
     if (candidates.length === 0) {
       return res.status(409).json({ error: "No eligible coffees found", size, grind });
     }
+
+    /* ── PATCH 2026-08-04: FIRST-SHIPMENT COFFEE REQUEST ─────────────────────
+       If this is the customer's FIRST subscription order AND the storefront
+       attached a coffee choice, honor it.
+
+       Resolved against the full candidate list BEFORE the no-repeat filter, so
+       an explicit request always wins over rotation logic. Gated on the
+       "Subscription First Order" tag because Smartrr copies line-item
+       properties onto renewal orders — without this gate the customer would be
+       pinned to their signup coffee forever.
+
+       Any failure here leaves requestedPick = null and the original random
+       path runs untouched.
+       ──────────────────────────────────────────────────────────────────────── */
+    let requestedPick = null;
+    let requestedHandle = null;
+    try {
+      const isFirstOrder = (order.tags || []).includes(FIRST_ORDER_TAG);
+      requestedHandle = getRequestedHandle(soLineItem);
+      if (isFirstOrder && requestedHandle) {
+        requestedPick =
+          candidates.find((c) => c.product_handle === requestedHandle) || null;
+        if (!requestedPick) {
+          // Requested coffee is gone, archived, or excluded — fall through to random.
+          console.warn(
+            `RC: requested coffee "${requestedHandle}" not eligible on ${order.name}; using random pick`
+          );
+        }
+      }
+    } catch (e) {
+      console.error("RC: first-coffee-request override skipped:", e);
+      requestedPick = null;
+    }
+    /* ── end patch ──────────────────────────────────────────────────────────── */
 
     // No-repeat if possible
     if (lastProductId && candidates.length > 1) {
       const filtered = candidates.filter((c) => c.product_id !== lastProductId);
       if (filtered.length > 0) candidates = filtered;
     }
-const debug = req.query?.debug === "1";
 
-if (debug) {
-  return res.status(200).json({
-    success: true,
-    debug: true,
-    order: order.name,
-    size,
-    grind,
-    lastProductId,
-    candidates_count: candidates.length,
-    candidates: candidates.map(c => ({
-      product_title: c.product_title,
-      product_handle: c.product_handle,
-      product_id: c.product_id
-    }))
-  });
-}
+    const debug = req.query?.debug === "1";
+    if (debug) {
+      return res.status(200).json({
+        success: true,
+        debug: true,
+        order: order.name,
+        size,
+        grind,
+        lastProductId,
+        /* PATCH: surface the request so you can confirm it arrived */
+        order_tags: order.tags,
+        requested_handle: requestedHandle,
+        requested_resolved: requestedPick ? requestedPick.product_title : null,
+        candidates_count: candidates.length,
+        candidates: candidates.map(c => ({
+          product_title: c.product_title,
+          product_handle: c.product_handle,
+          product_id: c.product_id
+        }))
+      });
+    }
+
     // TEMP: allow forcing a specific coffee for testing
-const force = req.query?.force;
-
-let pick = null;
-
-if (force) {
-  pick = candidates.find(c => c.product_handle === force) || null;
-}
-
-if (!pick) {
-  pick = pickRandom(candidates);
-}
+    const force = req.query?.force;
+    let pick = null;
+    if (force) {
+      pick = candidates.find(c => c.product_handle === force) || null;
+    }
+    /* PATCH: customer's own first-shipment choice, ahead of the random pick */
+    if (!pick && requestedPick) {
+      pick = requestedPick;
+    }
+    if (!pick) {
+      pick = pickRandom(candidates);
+    }
 
     const pickText = `${pick.product_title} — ${size} / ${grind}`;
     await setOrderPick(orderId, pickText);
 
-const pid = numericIdFromGid(pick.product_id);
-
-await addOrderTags(orderId, [
-  "RC_PICKED",
-  `RC_PID_${pid}`
-]);
+    const pid = numericIdFromGid(pick.product_id);
+    /* PATCH: RC_REQUESTED tag makes honored requests visible/filterable in admin */
+    const tagsToAdd = ["RC_PICKED", `RC_PID_${pid}`];
+    if (requestedPick && pick.product_id === requestedPick.product_id) {
+      tagsToAdd.push("RC_REQUESTED");
+    }
+    await addOrderTags(orderId, tagsToAdd);
 
     await appendOrderNote(orderId, pickText);
 
@@ -455,6 +498,9 @@ await addOrderTags(orderId, [
     return res.status(200).json({
       success: true,
       order: order.name,
+      /* PATCH: report whether the choice was honored */
+      honored_request: Boolean(requestedPick && pick.product_id === requestedPick.product_id),
+      requested_handle: requestedHandle,
       pick: {
         product_title: pick.product_title,
         product_handle: pick.product_handle,
