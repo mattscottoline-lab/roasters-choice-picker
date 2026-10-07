@@ -188,21 +188,35 @@ async function recordShippedCoffee(customerId, pick, missedTitle) {
   if (errs.length) throw new Error(`recordShippedCoffee errors: ${JSON.stringify(errs)}`);
 }
 
-/** Tell Klaviyo a pick sold out before it shipped, so the "we switched your coffee" email goes out. */
-async function notifyPickSwitched({ email, orderName, requestedTitle, shippedTitle, size, grind }) {
+/** One Klaviyo event on the customer's profile, optionally updating profile properties with it. */
+async function klaviyoEvent({ email, metric, properties, setProps, unsetProps }) {
   const key = process.env.KLAVIYO_PRIVATE_KEY;
-  if (!key || !email) { console.warn("RC: pick switched but no Klaviyo key/email; email not sent"); return false; }
+  if (!key || !email) { console.warn(`RC: ${metric} not sent to Klaviyo (no key or email)`); return false; }
+  const profile = { type: "profile", attributes: { email, ...(setProps ? { properties: setProps } : {}) } };
+  if (unsetProps?.length) profile.meta = { patch_properties: { unset: unsetProps } };
   const resp = await fetch("https://a.klaviyo.com/api/events", {
     method: "POST",
     headers: { authorization: `Klaviyo-API-Key ${key}`, revision: "2024-10-15", "content-type": "application/vnd.api+json", accept: "application/vnd.api+json" },
-    body: JSON.stringify({ data: { type: "event", attributes: {
-      properties: { requested: requestedTitle, shipped: shippedTitle, order: orderName, size, grind },
-      metric: { data: { type: "metric", attributes: { name: "Portal Pick Switched" } } },
-      profile: { data: { type: "profile", attributes: { email } } },
-    } } }),
+    body: JSON.stringify({ data: { type: "event", attributes: { properties, metric: { data: { type: "metric", attributes: { name: metric } } }, profile: { data: profile } } } }),
   });
-  if (!resp.ok) { console.error("RC: Klaviyo event failed", resp.status, await resp.text().catch(() => "")); return false; }
+  if (!resp.ok) { console.error("RC: Klaviyo event failed", metric, resp.status, await resp.text().catch(() => "")); return false; }
   return true;
+}
+
+/** Tell Klaviyo a pick sold out before it shipped, so the "we switched your coffee" email goes out.
+    The same call clears the pick from the profile and records what shipped (see syncPickToKlaviyo). */
+async function notifyPickSwitched({ email, orderName, requestedTitle, shippedTitle, size, grind }) {
+  return klaviyoEvent({ email, metric: "Portal Pick Switched",
+    properties: { requested: requestedTitle, shipped: shippedTitle, order: orderName, size, grind },
+    setProps: { last_coffee: shippedTitle }, unsetProps: ["next_coffee", "next_coffee_handle"] });
+}
+
+/** 2026-10-07: a honoured pick clears `next_coffee` on the Klaviyo profile (the portal set it when the
+    customer chose), so the upcoming-order email stops naming a coffee that has already shipped. */
+async function syncPickToKlaviyo({ email, orderName, shippedTitle, size, grind }) {
+  return klaviyoEvent({ email, metric: "Portal Pick Shipped",
+    properties: { shipped: shippedTitle, order: orderName, size, grind },
+    setProps: { last_coffee: shippedTitle }, unsetProps: ["next_coffee", "next_coffee_handle"] });
 }
 /* ── end 2026-10-05 patch helpers ─────────────────────────────────────────── */
 
@@ -590,7 +604,9 @@ export default async function handler(req, res) {
     let switchedEmail = false;
     try {
       await recordShippedCoffee(customerId, pick, portalMissed);
-      if (portalMissed) switchedEmail = await notifyPickSwitched({ email: order?.customer?.email || pickState.email, orderName: order.name, requestedTitle: portalMissed, shippedTitle: pick.product_title, size, grind });
+      const email = order?.customer?.email || pickState.email;
+      if (portalMissed) switchedEmail = await notifyPickSwitched({ email, orderName: order.name, requestedTitle: portalMissed, shippedTitle: pick.product_title, size, grind });
+      else if (portalPick) await syncPickToKlaviyo({ email, orderName: order.name, shippedTitle: pick.product_title, size, grind });
     } catch (e) {
       // The bag is picked and noted either way; this is bookkeeping for the portal.
       console.error("RC: recording the shipped coffee for the portal failed:", e);
