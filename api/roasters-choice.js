@@ -93,13 +93,18 @@ function getRequestedHandle(lineItem) {
 /* ── end patch helper ─────────────────────────────────────────────────────── */
 
 function findSizeAndGrindFromLineItems(lineItems) {
-  // First try to find the actual Single Origin Subscription item
+  // First try to find the actual Single Origin Subscription item.
+  // NOTE 2026-09-14: matched by HANDLE, not title. The product title was being
+  // renamed to "Single Origin Coffee Subscription" for SEO, which does NOT
+  // contain the old substring — the match would have failed silently and fallen
+  // through to "first line item with a Size and a Grind" (wrong bag on any
+  // multi-coffee order). The handle never changes; 27 theme files depend on it.
   const singleOriginLineItem = (lineItems || []).find((li) => {
-    const productTitle = li?.variant?.product?.title || "";
+    const productHandle = li?.variant?.product?.handle || "";
     const lineTitle = li?.title || "";
     const variantTitle = li?.variant?.title || "";
     return (
-      productTitle.includes("Single Origin Subscription") ||
+      productHandle === "roasters-choice-subscription" ||
       lineTitle.includes("Single Origin Subscription") ||
       variantTitle.includes("Single Origin - Roaster's Choice")
     );
@@ -130,24 +135,76 @@ function findSizeAndGrindFromLineItems(lineItems) {
   return { size: null, grind: null, lineItem: null };
 }
 
-async function getCustomerLastPickMap(customerId) {
+/* ── PATCH 2026-10-05: THE PORTAL'S NEXT-COFFEE PICK ──────────────────────────
+   On /pages/my-subscription a rotation subscriber can choose their next coffee.
+   The portal saves it on the customer's Shopify record as
+   roasters_choice.next_coffee = {"handle","title","requestedAt"}. It is a request
+   for ONE delivery: honoured here if the coffee is still eligible, then cleared.
+   Whatever ships is written back as roasters_choice.last_coffee = {"handle",
+   "title","day","missed"} so the portal can show the last bag, and say when a
+   pick sold out before it shipped ("missed" = the title they asked for).
+   ──────────────────────────────────────────────────────────────────────────── */
+async function getCustomerPickState(customerId) {
   const q = `
     query($id: ID!) {
       customer(id: $id) {
         id
-        metafield(namespace: "roasters_choice", key: "last_pick_map") { value }
+        email
+        lastMap: metafield(namespace: "roasters_choice", key: "last_pick_map") { value }
+        nextCoffee: metafield(namespace: "roasters_choice", key: "next_coffee") { value }
       }
     }
   `;
   const data = await shopifyGraphQL(q, { id: customerId });
-  const raw = data?.customer?.metafield?.value;
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return {};
-  }
+  const parse = (v, fallback) => { if (!v) return fallback; try { return JSON.parse(v); } catch { return fallback; } };
+  const next = parse(data?.customer?.nextCoffee?.value, null);
+  return {
+    lastMap: parse(data?.customer?.lastMap?.value, {}),
+    portalHandle: next && typeof next.handle === "string" ? next.handle.trim() : null,
+    portalTitle: next && typeof next.title === "string" ? next.title : null,
+    email: data?.customer?.email || null,
+  };
 }
+
+async function getCustomerLastPickMap(customerId) {
+  return (await getCustomerPickState(customerId)).lastMap;
+}
+
+/** After the pick: clear the request, and record what shipped (with the miss, if any). */
+async function recordShippedCoffee(customerId, pick, missedTitle) {
+  const day = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+  const m = `
+    mutation($set: [MetafieldsSetInput!]!, $del: [MetafieldIdentifierInput!]!) {
+      metafieldsSet(metafields: $set) { userErrors { field message } }
+      metafieldsDelete(metafields: $del) { userErrors { field message } }
+    }
+  `;
+  const data = await shopifyGraphQL(m, {
+    set: [{ ownerId: customerId, namespace: "roasters_choice", key: "last_coffee", type: "json",
+      value: JSON.stringify({ handle: pick.product_handle, title: pick.product_title, day, missed: missedTitle || null }) }],
+    del: [{ ownerId: customerId, namespace: "roasters_choice", key: "next_coffee" }],
+  });
+  const errs = [...(data?.metafieldsSet?.userErrors || []), ...(data?.metafieldsDelete?.userErrors || [])];
+  if (errs.length) throw new Error(`recordShippedCoffee errors: ${JSON.stringify(errs)}`);
+}
+
+/** Tell Klaviyo a pick sold out before it shipped, so the "we switched your coffee" email goes out. */
+async function notifyPickSwitched({ email, orderName, requestedTitle, shippedTitle, size, grind }) {
+  const key = process.env.KLAVIYO_PRIVATE_KEY;
+  if (!key || !email) { console.warn("RC: pick switched but no Klaviyo key/email; email not sent"); return false; }
+  const resp = await fetch("https://a.klaviyo.com/api/events", {
+    method: "POST",
+    headers: { authorization: `Klaviyo-API-Key ${key}`, revision: "2024-10-15", "content-type": "application/vnd.api+json", accept: "application/vnd.api+json" },
+    body: JSON.stringify({ data: { type: "event", attributes: {
+      properties: { requested: requestedTitle, shipped: shippedTitle, order: orderName, size, grind },
+      metric: { data: { type: "metric", attributes: { name: "Portal Pick Switched" } } },
+      profile: { data: { type: "profile", attributes: { email } } },
+    } } }),
+  });
+  if (!resp.ok) { console.error("RC: Klaviyo event failed", resp.status, await resp.text().catch(() => "")); return false; }
+  return true;
+}
+/* ── end 2026-10-05 patch helpers ─────────────────────────────────────────── */
 
 async function setCustomerLastPickMap(customerId, mapObj) {
   const m = `
@@ -394,7 +451,9 @@ export default async function handler(req, res) {
     }
 
     const key = "global";
-    const lastMap = await getCustomerLastPickMap(customerId);
+    /* PATCH 2026-10-05: one read for the no-repeat memory AND the portal pick. */
+    const pickState = await getCustomerPickState(customerId);
+    const lastMap = pickState.lastMap;
     const lastProductId = lastMap[key] || null;
 
     const collectionHandle = "single-origin-coffee";
@@ -437,6 +496,27 @@ export default async function handler(req, res) {
     }
     /* ── end patch ──────────────────────────────────────────────────────────── */
 
+    /* ── PATCH 2026-10-05: the portal's pick, on ANY order (first or recurring).
+       Resolved against the full list before the no-repeat filter: an explicit
+       request wins even if it repeats the last bag. If the coffee has been pulled
+       (draft, archived, excluded), it's a miss: random pick, remembered as missed
+       so the portal can say so and Klaviyo can email them. ─────────────────── */
+    let portalPick = null;
+    let portalMissed = null;
+    try {
+      if (pickState.portalHandle) {
+        portalPick = candidates.find((c) => c.product_handle === pickState.portalHandle) || null;
+        if (!portalPick) {
+          portalMissed = pickState.portalTitle || pickState.portalHandle;
+          console.warn(`RC: portal pick "${pickState.portalHandle}" not eligible on ${order.name}; using random pick`);
+        }
+      }
+    } catch (e) {
+      console.error("RC: portal pick skipped:", e);
+      portalPick = null;
+    }
+    /* ── end patch ──────────────────────────────────────────────────────────── */
+
     // No-repeat if possible
     if (lastProductId && candidates.length > 1) {
       const filtered = candidates.filter((c) => c.product_id !== lastProductId);
@@ -456,6 +536,10 @@ export default async function handler(req, res) {
         order_tags: order.tags,
         requested_handle: requestedHandle,
         requested_resolved: requestedPick ? requestedPick.product_title : null,
+        /* PATCH 2026-10-05 */
+        portal_handle: pickState.portalHandle,
+        portal_resolved: portalPick ? portalPick.product_title : null,
+        portal_missed: portalMissed,
         candidates_count: candidates.length,
         candidates: candidates.map(c => ({
           product_title: c.product_title,
@@ -470,6 +554,10 @@ export default async function handler(req, res) {
     let pick = null;
     if (force) {
       pick = candidates.find(c => c.product_handle === force) || null;
+    }
+    /* PATCH 2026-10-05: the portal pick comes first; it was made for this delivery. */
+    if (!pick && portalPick) {
+      pick = portalPick;
     }
     /* PATCH: customer's own first-shipment choice, ahead of the random pick */
     if (!pick && requestedPick) {
@@ -488,6 +576,9 @@ export default async function handler(req, res) {
     if (requestedPick && pick.product_id === requestedPick.product_id) {
       tagsToAdd.push("RC_REQUESTED");
     }
+    /* PATCH 2026-10-05: honoured portal picks and misses are visible in admin */
+    if (portalPick && pick.product_id === portalPick.product_id) tagsToAdd.push("RC_PORTAL_PICK");
+    if (portalMissed) tagsToAdd.push("RC_PICK_MISSED");
     await addOrderTags(orderId, tagsToAdd);
 
     await appendOrderNote(orderId, pickText);
@@ -495,12 +586,26 @@ export default async function handler(req, res) {
     lastMap[key] = pick.product_id;
     await setCustomerLastPickMap(customerId, lastMap);
 
+    /* PATCH 2026-10-05: tell the portal what shipped; clear the request now it's used. */
+    let switchedEmail = false;
+    try {
+      await recordShippedCoffee(customerId, pick, portalMissed);
+      if (portalMissed) switchedEmail = await notifyPickSwitched({ email: order?.customer?.email || pickState.email, orderName: order.name, requestedTitle: portalMissed, shippedTitle: pick.product_title, size, grind });
+    } catch (e) {
+      // The bag is picked and noted either way; this is bookkeeping for the portal.
+      console.error("RC: recording the shipped coffee for the portal failed:", e);
+    }
+
     return res.status(200).json({
       success: true,
       order: order.name,
       /* PATCH: report whether the choice was honored */
       honored_request: Boolean(requestedPick && pick.product_id === requestedPick.product_id),
       requested_handle: requestedHandle,
+      /* PATCH 2026-10-05 */
+      portal_pick_honored: Boolean(portalPick && pick.product_id === portalPick.product_id),
+      portal_pick_missed: portalMissed,
+      switched_email_sent: switchedEmail,
       pick: {
         product_title: pick.product_title,
         product_handle: pick.product_handle,
