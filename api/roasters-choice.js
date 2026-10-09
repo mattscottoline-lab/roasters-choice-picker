@@ -152,13 +152,20 @@ async function getCustomerPickState(customerId) {
         email
         lastMap: metafield(namespace: "roasters_choice", key: "last_pick_map") { value }
         nextCoffee: metafield(namespace: "roasters_choice", key: "next_coffee") { value }
+        ratings: metafield(namespace: "roasters_choice", key: "ratings") { value }
       }
     }
   `;
   const data = await shopifyGraphQL(q, { id: customerId });
   const parse = (v, fallback) => { if (!v) return fallback; try { return JSON.parse(v); } catch { return fallback; } };
   const next = parse(data?.customer?.nextCoffee?.value, null);
+  /* PATCH 2026-10-09: the portal's coffee log lets a subscriber mark a bag "not for me"
+     (roasters_choice.ratings = {"<product id digits>": "love"|"fine"|"no"}). A "no" lot is never
+     sent to them again by the rotation; an explicit portal pick still wins. */
+  const ratings = parse(data?.customer?.ratings?.value, {});
+  const avoid = new Set(Object.entries(ratings || {}).filter(([, v]) => v === "no").map(([k]) => String(k).replace(/\D/g, "")));
   return {
+    avoid,
     lastMap: parse(data?.customer?.lastMap?.value, {}),
     portalHandle: next && typeof next.handle === "string" ? next.handle.trim() : null,
     portalTitle: next && typeof next.title === "string" ? next.title : null,
@@ -536,6 +543,12 @@ export default async function handler(req, res) {
       const filtered = candidates.filter((c) => c.product_id !== lastProductId);
       if (filtered.length > 0) candidates = filtered;
     }
+    /* PATCH 2026-10-09: never send a lot the subscriber marked "not for me" in the portal's coffee log,
+       as long as something else is on the shelf. */
+    if (pickState.avoid && pickState.avoid.size && candidates.length > 1) {
+      const kept = candidates.filter((c) => !pickState.avoid.has(String(c.product_id).replace(/\D/g, "")));
+      if (kept.length > 0) candidates = kept;
+    }
 
     const debug = req.query?.debug === "1";
     if (debug) {
@@ -554,6 +567,7 @@ export default async function handler(req, res) {
         portal_handle: pickState.portalHandle,
         portal_resolved: portalPick ? portalPick.product_title : null,
         portal_missed: portalMissed,
+        avoid: [...(pickState.avoid || [])],
         candidates_count: candidates.length,
         candidates: candidates.map(c => ({
           product_title: c.product_title,
