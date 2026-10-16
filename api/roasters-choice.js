@@ -135,6 +135,62 @@ function findSizeAndGrindFromLineItems(lineItems) {
   return { size: null, grind: null, lineItem: null };
 }
 
+/* ── PATCH 2026-10-16: every Single Origin bag on the order ──────────────────
+   Returns one entry per BAG (a line with quantity 2 is two bags), in line
+   order, each with its size, grind and the line's `_first_coffee_request`.
+   `bagIndex` is the bag's position within its line (0 = first), so a request
+   is honoured once per line. If the order has no rotation line at all, falls
+   back to the old single "first line with a Size and a Grind" behaviour so
+   odd orders still get a pick.
+   ──────────────────────────────────────────────────────────────────────────── */
+function isSingleOriginLine(li) {
+  const productHandle = li?.variant?.product?.handle || "";
+  const lineTitle = li?.title || "";
+  const variantTitle = li?.variant?.title || "";
+  return (
+    productHandle === "roasters-choice-subscription" ||
+    lineTitle.includes("Single Origin Subscription") ||
+    variantTitle.includes("Single Origin - Roaster's Choice")
+  );
+}
+
+function sizeAndGrindOf(li) {
+  const opts = li?.variant?.selectedOptions || [];
+  const size = opts.find((o) => o.name === "Size")?.value || null;
+  const grind =
+    opts.find((o) => o.name === "Grind Size")?.value ||
+    opts.find((o) => o.name === "Whole Bean or Ground")?.value ||
+    null;
+  return { size, grind };
+}
+
+function getSingleOriginBags(lineItems, skipped = []) {
+  const bags = [];
+  (lineItems || []).forEach((li, lineIndex) => {
+    if (!isSingleOriginLine(li)) return;
+    const { size, grind } = sizeAndGrindOf(li);
+    if (!size || !grind) {
+      // One bad line must not block the others: skip it, say so, and let the caller report it.
+      console.warn(`RC: line ${lineIndex} (${li?.title || "?"}, ${li?.id || "?"}) has no Size/Grind; skipped`);
+      skipped.push({ line: lineIndex, id: li?.id || null, title: li?.title || null, reason: "no Size/Grind on the variant" });
+      return;
+    }
+    const qty = Math.max(1, Number(li?.quantity) || 1);
+    const requestedHandle = getRequestedHandle(li);
+    for (let bagIndex = 0; bagIndex < qty; bagIndex++) {
+      bags.push({ lineItem: li, lineIndex, bagIndex, size, grind, requestedHandle });
+    }
+  });
+  if (bags.length > 0) return bags;
+  // Fallback: old behaviour, one bag from the first line that has a size and a grind.
+  const { size, grind, lineItem } = findSizeAndGrindFromLineItems(lineItems);
+  if (size && grind) {
+    return [{ lineItem, lineIndex: 0, bagIndex: 0, size, grind, requestedHandle: getRequestedHandle(lineItem) }];
+  }
+  return [];
+}
+/* ── end 2026-10-16 helper ────────────────────────────────────────────────── */
+
 /* ── PATCH 2026-10-05: THE PORTAL'S NEXT-COFFEE PICK ──────────────────────────
    On /pages/my-subscription a rotation subscriber can choose their next coffee.
    The portal saves it on the customer's Shopify record as
@@ -461,61 +517,47 @@ export default async function handler(req, res) {
     }
 
     const lineItems = order.lineItems.nodes;
-    /* PATCH: also capture the matched Single Origin line item so we can read
-       its _first_coffee_request property below. */
-    const { size, grind, lineItem: soLineItem } = findSizeAndGrindFromLineItems(lineItems);
-    if (!size || !grind) {
+
+    /* ── PATCH 2026-10-16: ONE PICK PER BAG, NOT ONE PER ORDER ───────────────
+       An order can carry several Single Origin subscription lines (two coffee
+       pages subscribed in one checkout, a bag converted in the cart, a line
+       with quantity 2). The old code took the FIRST rotation line and ignored
+       the rest, so #106241 (two lines, two requests) got one coffee in the
+       note. Now every bag gets its own pick: a line's own request is honoured
+       on that line's first bag, the portal pick goes to the first bag without
+       a request, and random bags avoid everything already picked on this
+       order, the last bag they received, and their "not for me" list. The
+       note lists every bag.
+       ──────────────────────────────────────────────────────────────────────── */
+    const skippedLines = [];
+    const bags = getSingleOriginBags(lineItems, skippedLines);
+    if (bags.length === 0) {
       return res.status(409).json({
         error: "Could not determine Size and Grind Size from order line items",
         order_name: order.name,
+        skipped_lines: skippedLines,
       });
     }
+    // Kept for the reply/debug shape older callers read; the first bag's size & grind.
+    const { size, grind } = bags[0];
 
     const key = "global";
     /* PATCH 2026-10-05: one read for the no-repeat memory AND the portal pick. */
     const pickState = await getCustomerPickState(customerId);
     const lastMap = pickState.lastMap;
     const lastProductId = lastMap[key] || null;
+    // 2026-10-16: a multi-bag order remembers every coffee it shipped, so none of them repeats next time.
+    const lastProductIds = new Set(
+      [lastProductId, ...(Array.isArray(lastMap.global_all) ? lastMap.global_all : [])].filter(Boolean)
+    );
 
     const collectionHandle = "single-origin-coffee";
-    let candidates = await getEligibleFromCollection(collectionHandle);
-    if (candidates.length === 0) {
+    const allCandidates = await getEligibleFromCollection(collectionHandle);
+    if (allCandidates.length === 0) {
       return res.status(409).json({ error: "No eligible coffees found", size, grind });
     }
 
-    /* ── PATCH 2026-08-04: FIRST-SHIPMENT COFFEE REQUEST ─────────────────────
-       If this is the customer's FIRST subscription order AND the storefront
-       attached a coffee choice, honor it.
-
-       Resolved against the full candidate list BEFORE the no-repeat filter, so
-       an explicit request always wins over rotation logic. Gated on the
-       "Subscription First Order" tag because Smartrr copies line-item
-       properties onto renewal orders — without this gate the customer would be
-       pinned to their signup coffee forever.
-
-       Any failure here leaves requestedPick = null and the original random
-       path runs untouched.
-       ──────────────────────────────────────────────────────────────────────── */
-    let requestedPick = null;
-    let requestedHandle = null;
-    try {
-      const isFirstOrder = (order.tags || []).includes(FIRST_ORDER_TAG);
-      requestedHandle = getRequestedHandle(soLineItem);
-      if (isFirstOrder && requestedHandle) {
-        requestedPick =
-          candidates.find((c) => c.product_handle === requestedHandle) || null;
-        if (!requestedPick) {
-          // Requested coffee is gone, archived, or excluded — fall through to random.
-          console.warn(
-            `RC: requested coffee "${requestedHandle}" not eligible on ${order.name}; using random pick`
-          );
-        }
-      }
-    } catch (e) {
-      console.error("RC: first-coffee-request override skipped:", e);
-      requestedPick = null;
-    }
-    /* ── end patch ──────────────────────────────────────────────────────────── */
+    const isFirstOrder = (order.tags || []).includes(FIRST_ORDER_TAG);
 
     /* ── PATCH 2026-10-05: the portal's pick, on ANY order (first or recurring).
        Resolved against the full list before the no-repeat filter: an explicit
@@ -526,7 +568,7 @@ export default async function handler(req, res) {
     let portalMissed = null;
     try {
       if (pickState.portalHandle) {
-        portalPick = candidates.find((c) => c.product_handle === pickState.portalHandle) || null;
+        portalPick = allCandidates.find((c) => c.product_handle === pickState.portalHandle) || null;
         if (!portalPick) {
           portalMissed = pickState.portalTitle || pickState.portalHandle;
           console.warn(`RC: portal pick "${pickState.portalHandle}" not eligible on ${order.name}; using random pick`);
@@ -538,17 +580,69 @@ export default async function handler(req, res) {
     }
     /* ── end patch ──────────────────────────────────────────────────────────── */
 
-    // No-repeat if possible
-    if (lastProductId && candidates.length > 1) {
-      const filtered = candidates.filter((c) => c.product_id !== lastProductId);
-      if (filtered.length > 0) candidates = filtered;
+    const avoidIds = pickState.avoid || new Set();
+    const force = req.query?.force; // TEMP: allow forcing a specific coffee for testing (first bag only)
+
+    /* Decide each bag in order. `taken` is what this order has already been given. */
+    const taken = new Set();
+    const picks = [];
+    let portalUsed = false;
+    let anyRequestHonoured = false;
+    for (const bag of bags) {
+      let pick = null;
+      let how = "random";
+
+      // ?force= applies to the first bag only.
+      if (!pick && force && picks.length === 0) {
+        pick = allCandidates.find((c) => c.product_handle === force) || null;
+        if (pick) how = "forced";
+      }
+
+      /* ── PATCH 2026-08-04: FIRST-SHIPMENT COFFEE REQUEST ───────────────────
+         The storefront attaches `_first_coffee_request` to the line. Honoured
+         only on a first order (Smartrr copies properties onto renewals) and
+         only on the line's first bag — extra bags of the same line are random.
+         An explicit request is honoured even if another line asked for the
+         same coffee: the customer asked for two of it on purpose. ─────────── */
+      if (!pick && isFirstOrder && bag.requestedHandle && bag.bagIndex === 0) {
+        pick = allCandidates.find((c) => c.product_handle === bag.requestedHandle) || null;
+        if (pick) {
+          how = "requested";
+          anyRequestHonoured = true;
+        } else {
+          console.warn(`RC: requested coffee "${bag.requestedHandle}" not eligible on ${order.name}; using random pick`);
+        }
+      }
+
+      /* The portal pick was made for one delivery: the first bag that has no request of its own. */
+      if (!pick && portalPick && !portalUsed) {
+        pick = portalPick;
+        portalUsed = true;
+        how = "portal";
+      }
+
+      if (!pick) {
+        // Random: different from everything already on this order, then from the
+        // last bag(s) they got, then from their "not for me" list — each rule
+        // only applied while it leaves something on the shelf.
+        let pool = allCandidates.filter((c) => !taken.has(c.product_id));
+        if (pool.length === 0) pool = allCandidates.slice();
+        if (lastProductIds.size && pool.length > 1) {
+          const f = pool.filter((c) => !lastProductIds.has(c.product_id));
+          if (f.length > 0) pool = f;
+        }
+        if (avoidIds.size && pool.length > 1) {
+          const f = pool.filter((c) => !avoidIds.has(String(c.product_id).replace(/\D/g, "")));
+          if (f.length > 0) pool = f;
+        }
+        pick = pickRandom(pool);
+      }
+
+      taken.add(pick.product_id);
+      picks.push({ ...pick, size: bag.size, grind: bag.grind, how, requested_handle: bag.requestedHandle });
     }
-    /* PATCH 2026-10-09: never send a lot the subscriber marked "not for me" in the portal's coffee log,
-       as long as something else is on the shelf. */
-    if (pickState.avoid && pickState.avoid.size && candidates.length > 1) {
-      const kept = candidates.filter((c) => !pickState.avoid.has(String(c.product_id).replace(/\D/g, "")));
-      if (kept.length > 0) candidates = kept;
-    }
+
+    const pickText = picks.map((p) => `${p.product_title} — ${p.size} / ${p.grind}`).join("; ");
 
     const debug = req.query?.debug === "1";
     if (debug) {
@@ -558,90 +652,84 @@ export default async function handler(req, res) {
         order: order.name,
         size,
         grind,
+        bags: bags.length,
+        skipped_lines: skippedLines,
         lastProductId,
-        /* PATCH: surface the request so you can confirm it arrived */
+        last_product_ids: [...lastProductIds],
         order_tags: order.tags,
-        requested_handle: requestedHandle,
-        requested_resolved: requestedPick ? requestedPick.product_title : null,
-        /* PATCH 2026-10-05 */
+        requested_handle: bags[0].requestedHandle,
+        requested_handles: bags.map((b) => b.requestedHandle),
         portal_handle: pickState.portalHandle,
         portal_resolved: portalPick ? portalPick.product_title : null,
         portal_missed: portalMissed,
-        avoid: [...(pickState.avoid || [])],
-        candidates_count: candidates.length,
-        candidates: candidates.map(c => ({
+        avoid: [...avoidIds],
+        would_pick: picks.map((p) => ({ product_title: p.product_title, product_handle: p.product_handle, size: p.size, grind: p.grind, how: p.how })),
+        would_note: pickText,
+        candidates_count: allCandidates.length,
+        candidates: allCandidates.map((c) => ({
           product_title: c.product_title,
           product_handle: c.product_handle,
-          product_id: c.product_id
-        }))
+          product_id: c.product_id,
+        })),
       });
     }
 
-    // TEMP: allow forcing a specific coffee for testing
-    const force = req.query?.force;
-    let pick = null;
-    if (force) {
-      pick = candidates.find(c => c.product_handle === force) || null;
-    }
-    /* PATCH 2026-10-05: the portal pick comes first; it was made for this delivery. */
-    if (!pick && portalPick) {
-      pick = portalPick;
-    }
-    /* PATCH: customer's own first-shipment choice, ahead of the random pick */
-    if (!pick && requestedPick) {
-      pick = requestedPick;
-    }
-    if (!pick) {
-      pick = pickRandom(candidates);
-    }
-
-    const pickText = `${pick.product_title} — ${size} / ${grind}`;
     await setOrderPick(orderId, pickText);
 
-    const pid = numericIdFromGid(pick.product_id);
+    /* Tags: one RC_PID per distinct coffee; RC_MULTI_BAG marks orders with more than one bag. */
+    const tagsToAdd = ["RC_PICKED"];
+    for (const id of taken) tagsToAdd.push(`RC_PID_${numericIdFromGid(id)}`);
+    if (bags.length > 1) tagsToAdd.push("RC_MULTI_BAG");
     /* PATCH: RC_REQUESTED tag makes honored requests visible/filterable in admin */
-    const tagsToAdd = ["RC_PICKED", `RC_PID_${pid}`];
-    if (requestedPick && pick.product_id === requestedPick.product_id) {
-      tagsToAdd.push("RC_REQUESTED");
-    }
+    if (anyRequestHonoured) tagsToAdd.push("RC_REQUESTED");
     /* PATCH 2026-10-05: honoured portal picks and misses are visible in admin */
-    if (portalPick && pick.product_id === portalPick.product_id) tagsToAdd.push("RC_PORTAL_PICK");
+    if (portalUsed) tagsToAdd.push("RC_PORTAL_PICK");
     if (portalMissed) tagsToAdd.push("RC_PICK_MISSED");
     await addOrderTags(orderId, tagsToAdd);
 
     await appendOrderNote(orderId, pickText);
 
-    lastMap[key] = pick.product_id;
+    // `global` stays a single id for anything else that reads it; `global_all` carries every bag.
+    lastMap[key] = picks[picks.length - 1].product_id;
+    lastMap.global_all = [...taken];
     await setCustomerLastPickMap(customerId, lastMap);
 
-    /* PATCH 2026-10-05: tell the portal what shipped; clear the request now it's used. */
+    /* PATCH 2026-10-05: tell the portal what shipped; clear the request now it's used.
+       On a multi-bag order the portal's "last bag" names every coffee. */
+    const shippedTitle = picks.map((p) => p.product_title).join(" + ");
+    const firstPick = picks[0];
     let switchedEmail = false;
     try {
-      await recordShippedCoffee(customerId, pick, portalMissed);
+      await recordShippedCoffee(customerId, { product_handle: firstPick.product_handle, product_title: shippedTitle }, portalMissed);
       const email = order?.customer?.email || pickState.email;
-      if (portalMissed) switchedEmail = await notifyPickSwitched({ email, orderName: order.name, requestedTitle: portalMissed, shippedTitle: pick.product_title, size, grind });
-      else if (portalPick) await syncPickToKlaviyo({ email, orderName: order.name, shippedTitle: pick.product_title, size, grind });
+      if (portalMissed) switchedEmail = await notifyPickSwitched({ email, orderName: order.name, requestedTitle: portalMissed, shippedTitle, size, grind });
+      else if (portalUsed) await syncPickToKlaviyo({ email, orderName: order.name, shippedTitle, size, grind });
     } catch (e) {
-      // The bag is picked and noted either way; this is bookkeeping for the portal.
+      // The bags are picked and noted either way; this is bookkeeping for the portal.
       console.error("RC: recording the shipped coffee for the portal failed:", e);
     }
 
     return res.status(200).json({
       success: true,
       order: order.name,
-      /* PATCH: report whether the choice was honored */
-      honored_request: Boolean(requestedPick && pick.product_id === requestedPick.product_id),
-      requested_handle: requestedHandle,
+      bags: bags.length,
+      skipped_lines: skippedLines,
+      /* PATCH: report whether the choice was honored (first bag, for older readers) */
+      honored_request: firstPick.how === "requested",
+      requested_handle: bags[0].requestedHandle,
       /* PATCH 2026-10-05 */
-      portal_pick_honored: Boolean(portalPick && pick.product_id === portalPick.product_id),
+      portal_pick_honored: portalUsed,
       portal_pick_missed: portalMissed,
       switched_email_sent: switchedEmail,
       pick: {
-        product_title: pick.product_title,
-        product_handle: pick.product_handle,
-        size,
-        grind,
+        product_title: firstPick.product_title,
+        product_handle: firstPick.product_handle,
+        size: firstPick.size,
+        grind: firstPick.grind,
       },
+      /* 2026-10-16: every bag */
+      picks: picks.map((p) => ({ product_title: p.product_title, product_handle: p.product_handle, size: p.size, grind: p.grind, how: p.how })),
+      note: pickText,
     });
   } catch (err) {
     console.error("Roasters Choice handler error:", err);
